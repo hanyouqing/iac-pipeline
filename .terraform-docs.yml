@@ -1,0 +1,73 @@
+formatter: markdown table
+
+sections:
+  hide: []
+  show: []
+
+output:
+  file: README.md
+  mode: replace
+  template: |-
+    # {{.Name}}
+
+    {{if .Description}}
+    {{.Description}}
+    {{end}}
+
+    {{if .Inputs}}
+    ## Inputs
+
+    {{.Inputs}}
+    {{end}}
+
+    {{if .Modules}}
+    ## Modules
+
+    {{.Modules}}
+    {{end}}
+
+    {{if .Outputs}}
+    ## Outputs
+
+    {{.Outputs}}
+    {{end}}
+
+    {{if .Resources}}
+    ## Resources
+
+    {{.Resources}}
+    {{end}}
+
+    {{if .Requirements}}
+    ## Requirements
+
+    {{.Requirements}}
+    {{end}}
+
+    {{if .Providers}}
+    ## Providers
+
+    {{.Providers}}
+    {{end}}
+
+settings:
+  anchor: true
+  color: true
+  description: false
+  escape: true
+  hide-empty: false
+  html: true
+  indent: 2
+  lockfile: true
+  read-comments: true
+  required: true
+  sensitive: true
+  sort: true
+  type: true
+
+# Working directories for terraform-docs (excludes root directory)
+working_directories:
+  - terraform/modules/oci
+  - terraform/sites/oci-labs
+  - terraform/sites/oci-proxy
+  - terraform/sites/oci-tfstate

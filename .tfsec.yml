@@ -1,0 +1,31 @@
+---
+# Minimum version of tfsec to use
+minimum_version: 1.28.1
+
+# Enable all available checks
+enable_all_checks: true
+
+# Exclude specific checks if needed
+exclude:
+  - OCI001  # Ensure all data stored in the Object Storage bucket has the same sensitivity level tag
+  - OCI002  # Ensure the Object Storage bucket has access logging enabled
+  - AWS017  # Ensure all data stored in the S3 bucket have the same sensitivity level tag
+  - AWS018  # Ensure the S3 bucket has access logging enabled
+
+# Custom checks
+custom_checks:
+  - code: CUSTOM001
+    description: "Ensure all resources have proper tags"
+    severity: WARNING
+    required_labels:
+      - "Environment"
+      - "Project"
+      - "costCenter"
+      - "Owner"
+      - "CodeSource"
+
+# Working directories for all sites
+working_directories:
+  - terraform/sites/oci-labs
+  - terraform/sites/oci-proxy
+  - terraform/sites/oci-tfstate
