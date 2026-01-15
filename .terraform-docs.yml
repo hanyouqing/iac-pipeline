@@ -67,7 +67,7 @@ settings:
 
 # Working directories for terraform-docs (excludes root directory)
 working_directories:
-  - terraform/modules/oci
+  - terraform/sites/example
   - terraform/sites/oci-labs
   - terraform/sites/oci-proxy
   - terraform/sites/oci-tfstate

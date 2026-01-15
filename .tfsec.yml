@@ -18,14 +18,17 @@ custom_checks:
     description: "Ensure all resources have proper tags"
     severity: WARNING
     required_labels:
+      - "Code"
+      - "CostCenter"
       - "Environment"
       - "Project"
-      - "costCenter"
       - "Owner"
-      - "CodeSource"
+      - "Project"
 
 # Working directories for all sites
 working_directories:
+  - terraform/sites/example
   - terraform/sites/oci-labs
   - terraform/sites/oci-proxy
   - terraform/sites/oci-tfstate
+
