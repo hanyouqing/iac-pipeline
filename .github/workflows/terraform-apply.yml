@@ -1,0 +1,288 @@
+name: Terraform Apply on Approval
+
+on:
+  pull_request_review:
+    types: [submitted]
+    paths:
+      - 'terraform/**/*.tf'
+      - 'terraform/**/*.tfvars'
+      - '.github/workflows/terraform-apply.yml'
+  workflow_dispatch:
+    inputs:
+      project:
+        description: 'Project name (e.g., demo, apiadmin, openauth). Required for manual trigger'
+        required: true
+        type: string
+      resource:
+        description: 'Resource name (e.g., vpc, jump, gitlab). Required for manual trigger'
+        required: true
+        type: string
+      environment:
+        description: 'Environment name'
+        required: false
+        type: choice
+        options:
+          - development
+          - testing
+          - staging
+          - productional
+        default: development
+      auto_approve:
+        description: 'Auto-approve apply (use with caution)'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  AWS_REGION: us-east-1
+  TF_VERSION: 1.14.2
+
+jobs:
+  detect-changes:
+    name: Detect Changed Resources
+    runs-on: ubuntu-latest
+    outputs:
+      resources: ${{ steps.changes.outputs.resources }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed resources
+        id: changes
+        run: |
+          echo "Detecting resources to apply..."
+          
+          # For manual trigger, use the specified project and resource
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            PROJECT="${{ github.event.inputs.project }}"
+            RESOURCE="${{ github.event.inputs.resource }}"
+            echo "Manual trigger with project: $PROJECT, resource: $RESOURCE"
+            if [ -d "terraform/$PROJECT/$RESOURCE" ]; then
+              RESOURCES_JSON=$(echo "[{\"project\":\"$PROJECT\",\"resource\":\"$RESOURCE\"}]" | jq -c '.')
+              echo "resources=$RESOURCES_JSON" >> $GITHUB_OUTPUT
+            else
+              echo "Resource terraform/$PROJECT/$RESOURCE not found"
+              echo "resources=[]" >> $GITHUB_OUTPUT
+            fi
+            exit 0
+          fi
+          
+          # For PR review, check if review is approved
+          if [ "${{ github.event.review.state }}" != "approved" ]; then
+            echo "Review is not approved, skipping"
+            echo "resources=[]" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Get changed files from PR
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          
+          # Find changed directories in terraform/<project>/<resource>/
+          CHANGED_PATHS=$(git diff --name-only --diff-filter=ACMRTUXB "$BASE_SHA" "$HEAD_SHA" | \
+            grep -E '^terraform/[^/]+/[^/]+/' | \
+            sed 's|terraform/\([^/]*\)/\([^/]*\)/.*|\1/\2|' | \
+            sort -u)
+          
+          if [ -z "$CHANGED_PATHS" ]; then
+            echo "No changed resources detected"
+            echo "resources=[]" >> $GITHUB_OUTPUT
+          else
+            echo "Changed project/resource pairs:"
+            echo "$CHANGED_PATHS" | while IFS=/ read -r project resource; do
+              echo "  - Project: $project, Resource: $resource"
+            done
+            
+            # Convert to JSON array with project and resource
+            RESOURCES_JSON=$(echo "$CHANGED_PATHS" | \
+              jq -R -s 'split("\n") | map(select(. != "")) | map(split("/")) | map({project: .[0], resource: .[1]})')
+            echo "resources=$RESOURCES_JSON" >> $GITHUB_OUTPUT
+          fi
+
+  terraform-apply:
+    name: Terraform Apply
+    needs: detect-changes
+    if: needs.detect-changes.outputs.resources != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        config: ${{ fromJson(needs.detect-changes.outputs.resources) }}
+      fail-fast: false
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # TODO: Migrate to OIDC for better security
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 3600
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Check State Lock
+        id: check-lock
+        working-directory: terraform/${{ matrix.config.project }}/${{ matrix.config.resource }}
+        run: |
+          echo "Checking for existing state locks..."
+          if [ -f backend.hcl ]; then
+            terraform init -backend-config=backend.hcl -backend=false 2>&1 | grep -q "Error acquiring the state lock" && {
+              echo "State is locked. Waiting for lock to be released..."
+              echo "locked=true" >> $GITHUB_OUTPUT
+              exit 1
+            } || echo "locked=false" >> $GITHUB_OUTPUT
+          else
+            echo "locked=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Terraform Init
+        working-directory: terraform/${{ matrix.config.project }}/${{ matrix.config.resource }}
+        run: |
+          if [ -f backend.hcl ]; then
+            terraform init -backend-config=backend.hcl
+          else
+            terraform init
+          fi
+        env:
+          TF_LOG: INFO
+          TF_LOG_PATH: terraform-init.log
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: terraform/${{ matrix.config.project }}/${{ matrix.config.resource }}
+        run: |
+          echo "Running terraform plan for project: ${{ matrix.config.project }}, resource: ${{ matrix.config.resource }}"
+          
+          # Use environment variable if provided
+          ENV_VAR=""
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.environment }}" ]; then
+            ENV_VAR="-var=environment=${{ github.event.inputs.environment }}"
+          fi
+          
+          terraform plan $ENV_VAR -out=tfplan
+        continue-on-error: true
+
+      - name: Backup State File
+        id: backup-state
+        working-directory: terraform/${{ matrix.config.project }}/${{ matrix.config.resource }}
+        if: github.event_name == 'pull_request_review'
+        run: |
+          echo "Creating state file backup before apply..."
+          BACKUP_TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          BACKUP_FILE="terraform-state-backup-${BACKUP_TIMESTAMP}.tfstate"
+          terraform state pull > "$BACKUP_FILE" 2>&1 || echo "State backup failed (may not exist yet)"
+          echo "backup_file=$BACKUP_FILE" >> $GITHUB_OUTPUT
+        continue-on-error: true
+
+      - name: Terraform Apply
+        id: apply
+        working-directory: terraform/${{ matrix.config.project }}/${{ matrix.config.resource }}
+        timeout-minutes: 60
+        run: |
+          echo "Running terraform apply for project: ${{ matrix.config.project }}, resource: ${{ matrix.config.resource }}"
+          START_TIME=$(date +%s)
+          
+          # Check if auto-approve is enabled for manual trigger
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.auto_approve }}" = "true" ]; then
+            echo "Auto-approve enabled, applying changes..."
+            terraform apply -auto-approve tfplan
+            APPLY_EXIT_CODE=$?
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Auto-approve not enabled. Use -auto-approve flag or set auto_approve input to true"
+            terraform apply tfplan
+            APPLY_EXIT_CODE=$?
+          else
+            # For PR approval, always auto-approve
+            terraform apply -auto-approve tfplan
+            APPLY_EXIT_CODE=$?
+          fi
+          
+          END_TIME=$(date +%s)
+          DURATION=$((END_TIME - START_TIME))
+          echo "duration=$DURATION" >> $GITHUB_OUTPUT
+          echo "apply_exit_code=$APPLY_EXIT_CODE" >> $GITHUB_OUTPUT
+          
+          exit $APPLY_EXIT_CODE
+        continue-on-error: true
+
+      - name: Rollback on Failure
+        if: steps.apply.outcome == 'failure' && steps.backup-state.outcome == 'success'
+        working-directory: terraform/${{ matrix.config.project }}/${{ matrix.config.resource }}
+        run: |
+          echo "⚠️ Apply failed. Attempting to restore state from backup..."
+          BACKUP_FILE="${{ steps.backup-state.outputs.backup_file }}"
+          if [ -f "$BACKUP_FILE" ]; then
+            terraform state push "$BACKUP_FILE" || echo "State restore failed. Manual intervention required."
+          fi
+        continue-on-error: true
+
+      - name: Comment PR or Create Commit Comment
+        uses: actions/github-script@v7
+        if: always()
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const status = '${{ steps.apply.outcome }}';
+            const emoji = status === 'success' ? '✅' : '❌';
+            const statusText = status === 'success' ? 'Success' : 'Failed';
+            const triggerType = context.eventName === 'workflow_dispatch' ? 'Manual Trigger' : 'PR Approval';
+            const project = '${{ matrix.config.project }}';
+            const resource = '${{ matrix.config.resource }}';
+            
+            let comment = `## ${emoji} Terraform Apply: \`${project}/${resource}\` (${triggerType})
+
+**Project:** \`${project}\`
+**Resource:** \`${resource}\`
+**Path:** \`terraform/${project}/${resource}\`
+**Status:** ${statusText}
+**Trigger:** ${triggerType}
+`;
+            
+            if (context.eventName === 'pull_request_review') {
+              comment += `**PR Author:** @${{ github.event.pull_request.user.login }}
+**Approved by:** @${{ github.event.review.user.login }}
+`;
+            } else {
+              comment += `**Triggered by:** @${context.actor}
+`;
+              if ('${{ github.event.inputs.environment }}') {
+                comment += `**Environment:** ${{ github.event.inputs.environment }}
+`;
+              }
+            }
+            
+            comment += `\n${status === 'success' ? '✅ Infrastructure changes have been applied successfully.' : '❌ Apply failed. Please check the logs for details.'}`;
+            
+            if (context.eventName === 'pull_request_review') {
+              const prNumber = context.payload.pull_request?.number || context.issue?.number;
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: comment
+              });
+            } else {
+              // For manual trigger, create a commit comment
+              const commitSha = context.sha;
+              await github.rest.repos.createCommitComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                commit_sha: commitSha,
+                body: comment
+              });
+            }
+
+      - name: Update PR Status
+        if: steps.apply.outcome == 'failure'
+        run: |
+          echo "Terraform apply failed for project: ${{ matrix.config.project }}, resource: ${{ matrix.config.resource }}"
+          exit 1
