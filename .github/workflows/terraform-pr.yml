@@ -1,0 +1,347 @@
+name: Terraform Plan on PR
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'terraform/**/*.tf'
+      - 'terraform/**/*.tfvars'
+      - '.github/workflows/terraform-pr.yml'
+  workflow_dispatch:
+    inputs:
+      project:
+        description: 'Project name (e.g., demo, apiadmin, openauth). Leave empty to detect from changes'
+        required: false
+        type: string
+      resource:
+        description: 'Resource name (e.g., vpc, jump, gitlab). Leave empty to detect from changes'
+        required: false
+        type: string
+      environment:
+        description: 'Environment name'
+        required: false
+        type: choice
+        options:
+          - dev
+          - testing
+          - staging
+          - production
+        default: dev
+
+env:
+  AWS_REGION: us-east-1
+  TF_VERSION: 1.14.0
+
+jobs:
+  detect-changes:
+    name: Detect Changed Resources
+    runs-on: ubuntu-latest
+    outputs:
+      resources: ${{ steps.changes.outputs.resources }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed resources
+        id: changes
+        run: |
+          echo "Detecting resources to plan..."
+          
+          # If manual trigger with specific project and resource, use that
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.project }}" ] && [ -n "${{ github.event.inputs.resource }}" ]; then
+            PROJECT="${{ github.event.inputs.project }}"
+            RESOURCE="${{ github.event.inputs.resource }}"
+            echo "Manual trigger with project: $PROJECT, resource: $RESOURCE"
+            if [ -d "terraform/$PROJECT/$RESOURCE" ]; then
+              RESOURCES_JSON=$(echo "[{\"project\":\"$PROJECT\",\"resource\":\"$RESOURCE\"}]" | jq -c '.')
+              echo "resources=$RESOURCES_JSON" >> $GITHUB_OUTPUT
+            else
+              echo "Resource terraform/$PROJECT/$RESOURCE not found"
+              echo "resources=[]" >> $GITHUB_OUTPUT
+            fi
+            exit 0
+          fi
+          
+          # Get changed files
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # For manual trigger without specific resource, compare with main branch
+            BASE_SHA="origin/main"
+            HEAD_SHA="HEAD"
+          else
+            BASE_SHA="${{ github.event.before }}"
+            HEAD_SHA="${{ github.event.after }}"
+          fi
+          
+          # Find changed directories in terraform/<project>/<resource>/
+          # Extract project and resource pairs
+          CHANGED_PATHS=$(git diff --name-only --diff-filter=ACMRTUXB "$BASE_SHA" "$HEAD_SHA" | \
+            grep -E '^terraform/[^/]+/[^/]+/' | \
+            sed 's|terraform/\([^/]*\)/\([^/]*\)/.*|\1/\2|' | \
+            sort -u)
+          
+          if [ -z "$CHANGED_PATHS" ]; then
+            echo "No changed resources detected"
+            # For manual trigger, list all available projects and resources
+            if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+              echo "Available projects and resources:"
+              for project_dir in terraform/*/; do
+                if [ -d "$project_dir" ]; then
+                  project=$(basename "$project_dir")
+                  echo "  Project: $project"
+                  for resource_dir in "$project_dir"*/; do
+                    if [ -d "$resource_dir" ] && [ -f "$resource_dir/main.tf" ] || [ -f "$resource_dir/*.tf" ]; then
+                      resource=$(basename "$resource_dir")
+                      echo "    - $resource"
+                    fi
+                  done
+                fi
+              done
+            fi
+            echo "resources=[]" >> $GITHUB_OUTPUT
+          else
+            echo "Changed project/resource pairs:"
+            echo "$CHANGED_PATHS" | while IFS=/ read -r project resource; do
+              echo "  - Project: $project, Resource: $resource"
+            done
+            
+            # Convert to JSON array with project and resource
+            RESOURCES_JSON=$(echo "$CHANGED_PATHS" | \
+              jq -R -s 'split("\n") | map(select(. != "")) | map(split("/")) | map({project: .[0], resource: .[1]})')
+            echo "resources=$RESOURCES_JSON" >> $GITHUB_OUTPUT
+          fi
+
+  terraform-plan:
+    name: Terraform Plan
+    needs: detect-changes
+    if: needs.detect-changes.outputs.resources != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        config: ${{ fromJson(needs.detect-changes.outputs.resources) }}
+      fail-fast: false
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # TODO: Migrate to OIDC for better security
+          # role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          # role-session-name: GitHubActions-TerraformPlan
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          # Add session duration limit for security
+          role-duration-seconds: 3600
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Set project and resource
+        id: set-vars
+        run: |
+          PROJECT="${{ matrix.config.project }}"
+          RESOURCE="${{ matrix.config.resource }}"
+          echo "project=$PROJECT" >> $GITHUB_OUTPUT
+          echo "resource=$RESOURCE" >> $GITHUB_OUTPUT
+          echo "terraform_dir=terraform/$PROJECT/$RESOURCE" >> $GITHUB_OUTPUT
+
+      - name: Check State Lock
+        id: check-lock
+        working-directory: terraform/${{ matrix.config.project }}/${{ matrix.config.resource }}
+        run: |
+          echo "Checking for existing state locks..."
+          if [ -f backend.hcl ]; then
+            terraform init -backend-config=backend.hcl -backend=false 2>&1 | grep -q "Error acquiring the state lock" && echo "locked=true" >> $GITHUB_OUTPUT || echo "locked=false" >> $GITHUB_OUTPUT
+          else
+            echo "locked=false" >> $GITHUB_OUTPUT
+          fi
+        continue-on-error: true
+
+      - name: Terraform Init
+        working-directory: terraform/${{ matrix.config.project }}/${{ matrix.config.resource }}
+        run: |
+          if [ -f backend.hcl ]; then
+            terraform init -backend-config=backend.hcl
+          else
+            terraform init -backend=false
+          fi
+        env:
+          TF_LOG: INFO
+          TF_LOG_PATH: terraform-init.log
+
+      - name: Terraform Validate
+        working-directory: terraform/${{ matrix.config.project }}/${{ matrix.config.resource }}
+        run: terraform validate
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: terraform/${{ matrix.config.project }}/${{ matrix.config.resource }}
+        timeout-minutes: 30
+        run: |
+          PLAN_FILE="plan-${{ matrix.config.project }}-${{ matrix.config.resource }}.txt"
+          PLAN_JSON="plan-${{ matrix.config.project }}-${{ matrix.config.resource }}.json"
+          echo "Running terraform plan for project: ${{ matrix.config.project }}, resource: ${{ matrix.config.resource }}"
+          
+          # Use environment variable if provided in manual trigger
+          ENV_VAR=""
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.environment }}" ]; then
+            ENV_VAR="-var=environment=${{ github.event.inputs.environment }}"
+          fi
+          
+          # Run plan with detailed output
+          START_TIME=$(date +%s)
+          terraform plan -no-color $ENV_VAR -out=tfplan > "$PLAN_FILE" 2>&1 || PLAN_EXIT_CODE=$?
+          END_TIME=$(date +%s)
+          DURATION=$((END_TIME - START_TIME))
+          
+          # Generate JSON plan for analysis
+          terraform show -json tfplan > "$PLAN_JSON" 2>&1 || true
+          
+          # Extract plan summary
+          if [ -f "$PLAN_FILE" ]; then
+            terraform show -no-color tfplan >> "$PLAN_FILE" 2>&1 || true
+            
+            # Count resources
+            ADD_COUNT=$(grep -c "will be created" "$PLAN_FILE" || echo "0")
+            CHANGE_COUNT=$(grep -c "will be updated" "$PLAN_FILE" || echo "0")
+            DESTROY_COUNT=$(grep -c "will be destroyed" "$PLAN_FILE" || echo "0")
+            
+            echo "add_count=$ADD_COUNT" >> $GITHUB_OUTPUT
+            echo "change_count=$CHANGE_COUNT" >> $GITHUB_OUTPUT
+            echo "destroy_count=$DESTROY_COUNT" >> $GITHUB_OUTPUT
+            echo "duration=$DURATION" >> $GITHUB_OUTPUT
+          fi
+          
+          echo "plan_file=$PLAN_FILE" >> $GITHUB_OUTPUT
+          echo "plan_json=$PLAN_JSON" >> $GITHUB_OUTPUT
+          
+          # Exit with plan exit code if it failed
+          exit ${PLAN_EXIT_CODE:-0}
+        continue-on-error: true
+
+      - name: Upload Plan Artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: plan-${{ matrix.config.project }}-${{ matrix.config.resource }}
+          path: |
+            terraform/${{ matrix.config.project }}/${{ matrix.config.resource }}/plan-${{ matrix.config.project }}-${{ matrix.config.resource }}.txt
+            terraform/${{ matrix.config.project }}/${{ matrix.config.resource }}/plan-${{ matrix.config.project }}-${{ matrix.config.resource }}.json
+            terraform/${{ matrix.config.project }}/${{ matrix.config.resource }}/terraform-init.log
+          retention-days: 7
+
+      - name: Comment PR or Create Issue Comment
+        uses: actions/github-script@v7
+        if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+        env:
+          PLAN_FILE: terraform/${{ matrix.config.project }}/${{ matrix.config.resource }}/plan-${{ matrix.config.project }}-${{ matrix.config.resource }}.txt
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            
+            const planFile = '${{ env.PLAN_FILE }}';
+            let planContent = '';
+            
+            if (fs.existsSync(planFile)) {
+              planContent = fs.readFileSync(planFile, 'utf8');
+            } else {
+              planContent = 'Plan file not found or plan failed.';
+            }
+            
+            const maxLength = 65536; // GitHub comment limit
+            if (planContent.length > maxLength) {
+              planContent = planContent.substring(0, maxLength - 100) + '\n\n... (truncated)';
+            }
+            
+            const triggerType = context.eventName === 'workflow_dispatch' ? 'Manual Trigger' : 'PR';
+            const project = '${{ matrix.config.project }}';
+            const resource = '${{ matrix.config.resource }}';
+            const addCount = '${{ steps.plan.outputs.add_count }}' || '0';
+            const changeCount = '${{ steps.plan.outputs.change_count }}' || '0';
+            const destroyCount = '${{ steps.plan.outputs.destroy_count }}' || '0';
+            const duration = '${{ steps.plan.outputs.duration }}' || '0';
+            const status = '${{ steps.plan.outcome }}' === 'success' ? '✅ Success' : '❌ Failed';
+            
+            // Warning for destructive changes
+            let warning = '';
+            if (destroyCount > 0) {
+              warning = `\n⚠️ **Warning:** This plan will destroy ${destroyCount} resource(s). Please review carefully!`;
+            }
+            
+            const comment = `## 🔍 Terraform Plan: \`${project}/${resource}\` (${triggerType})
+
+<details>
+<summary>Click to expand plan output</summary>
+
+\`\`\`
+${planContent}
+\`\`\`
+
+</details>
+
+**Project:** \`${project}\`
+**Resource:** \`${resource}\`
+**Path:** \`terraform/${project}/${resource}\`
+**Status:** ${status}
+**Trigger:** ${triggerType}
+**Duration:** ${duration}s
+${{ github.event_name == 'workflow_dispatch' && github.event.inputs.environment ? `**Environment:** ${github.event.inputs.environment}` : ''}
+
+**Resource Changes:**
+- ➕ Add: ${addCount}
+- 🔄 Change: ${changeCount}
+- ➖ Destroy: ${destroyCount}
+${warning}
+`;
+            
+            // For PR, comment on PR. For manual trigger, create a commit comment or issue comment
+            if (context.eventName === 'pull_request') {
+              // Find existing comment
+              const { data: comments } = await github.rest.issues.listComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+              });
+              
+              const botComment = comments.find(comment => 
+                comment.user.type === 'Bot' && 
+                comment.body.includes(`Terraform Plan: \`${project}/${resource}\``)
+              );
+              
+              if (botComment) {
+                await github.rest.issues.updateComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: botComment.id,
+                  body: comment
+                });
+              } else {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.issue.number,
+                  body: comment
+                });
+              }
+            } else {
+              // For manual trigger, create a commit comment
+              const commitSha = context.sha;
+              await github.rest.repos.createCommitComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                commit_sha: commitSha,
+                body: comment
+              });
+            }

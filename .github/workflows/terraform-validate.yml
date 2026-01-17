@@ -1,0 +1,134 @@
+name: Terraform Validate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'terraform/**/*.tf'
+      - '.github/workflows/terraform-validate.yml'
+  workflow_dispatch:
+    inputs:
+      project:
+        description: 'Project name (e.g., demo, apiadmin, openauth). Leave empty to detect from changes'
+        required: false
+        type: string
+      resource:
+        description: 'Resource name (e.g., vpc, jump, gitlab). Leave empty to detect from changes'
+        required: false
+        type: string
+
+env:
+  TF_VERSION: 1.14.0
+
+jobs:
+  detect-changes:
+    name: Detect Changed Resources
+    runs-on: ubuntu-latest
+    outputs:
+      resources: ${{ steps.changes.outputs.resources }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed resources
+        id: changes
+        run: |
+          echo "Detecting resources to validate..."
+          
+          # If manual trigger with specific project and resource, use that
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.project }}" ] && [ -n "${{ github.event.inputs.resource }}" ]; then
+            PROJECT="${{ github.event.inputs.project }}"
+            RESOURCE="${{ github.event.inputs.resource }}"
+            echo "Manual trigger with project: $PROJECT, resource: $RESOURCE"
+            if [ -d "terraform/$PROJECT/$RESOURCE" ]; then
+              RESOURCES_JSON=$(echo "[{\"project\":\"$PROJECT\",\"resource\":\"$RESOURCE\"}]" | jq -c '.')
+              echo "resources=$RESOURCES_JSON" >> $GITHUB_OUTPUT
+            else
+              echo "Resource terraform/$PROJECT/$RESOURCE not found"
+              echo "resources=[]" >> $GITHUB_OUTPUT
+            fi
+            exit 0
+          fi
+          
+          # Get changed files
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # For manual trigger without specific resource, compare with main branch
+            BASE_SHA="origin/main"
+            HEAD_SHA="HEAD"
+          else
+            BASE_SHA="${{ github.event.before }}"
+            HEAD_SHA="${{ github.event.after }}"
+          fi
+          
+          # Find changed directories in terraform/<project>/<resource>/
+          CHANGED_PATHS=$(git diff --name-only --diff-filter=ACMRTUXB "$BASE_SHA" "$HEAD_SHA" | \
+            grep -E '^terraform/[^/]+/[^/]+/' | \
+            sed 's|terraform/\([^/]*\)/\([^/]*\)/.*|\1/\2|' | \
+            sort -u)
+          
+          if [ -z "$CHANGED_PATHS" ]; then
+            echo "No changed resources detected"
+            # For manual trigger, list all available projects and resources
+            if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+              echo "Available projects and resources:"
+              for project_dir in terraform/*/; do
+                if [ -d "$project_dir" ]; then
+                  project=$(basename "$project_dir")
+                  echo "  Project: $project"
+                  for resource_dir in "$project_dir"*/; do
+                    if [ -d "$resource_dir" ] && ([ -f "$resource_dir/main.tf" ] || ls "$resource_dir"/*.tf >/dev/null 2>&1); then
+                      resource=$(basename "$resource_dir")
+                      echo "    - $resource"
+                    fi
+                  done
+                fi
+              done
+            fi
+            echo "resources=[]" >> $GITHUB_OUTPUT
+          else
+            echo "Changed project/resource pairs:"
+            echo "$CHANGED_PATHS" | while IFS=/ read -r project resource; do
+              echo "  - Project: $project, Resource: $resource"
+            done
+            
+            # Convert to JSON array with project and resource
+            RESOURCES_JSON=$(echo "$CHANGED_PATHS" | \
+              jq -R -s 'split("\n") | map(select(. != "")) | map(split("/")) | map({project: .[0], resource: .[1]})')
+            echo "resources=$RESOURCES_JSON" >> $GITHUB_OUTPUT
+          fi
+
+  terraform-validate:
+    name: Terraform Validate
+    needs: detect-changes
+    if: needs.detect-changes.outputs.resources != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        config: ${{ fromJson(needs.detect-changes.outputs.resources) }}
+      fail-fast: false
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Format Check
+        working-directory: terraform/${{ matrix.config.project }}/${{ matrix.config.resource }}
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Init
+        working-directory: terraform/${{ matrix.config.project }}/${{ matrix.config.resource }}
+        run: terraform init -backend=false
+
+      - name: Terraform Validate
+        working-directory: terraform/${{ matrix.config.project }}/${{ matrix.config.resource }}
+        run: terraform validate
